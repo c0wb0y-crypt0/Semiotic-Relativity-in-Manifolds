@@ -3,24 +3,32 @@ import sys
 from pathlib import Path
 from collections import Counter
 
-# Flexible input
+# Flexible input: single file arg or glob all in Results/
 if len(sys.argv) > 1:
     csv_path = sys.argv[1]
+    csv_files = [Path(csv_path)]
+    print(f"\nAnalyzing single file: {Path(csv_path).name}")
 else:
-    csv_files = sorted(Path('.').glob('results_fast_*.csv'))  # All temps
+    csv_files = sorted(Path('Results').glob('*.csv'))
     if not csv_files:
-        print("No CSVs found!")
+        print("No CSVs found in Results/ folder!")
         sys.exit(1)
-    print("Found multiple CSVs—analyzing ALL for cross-temp summary:")
+    print("Found multiple CSVs in Results/—analyzing ALL for cross-temp summary:")
     for f in csv_files:
         print(f" - {f.name}")
 
-# Load all or single
-if len(sys.argv) > 1:
-    dfs = [pd.read_csv(csv_path)]
-    print(f"\nAnalyzing single file: {Path(csv_path).name}")
-else:
-    dfs = [pd.read_csv(f) for f in csv_files]
+# Load all
+dfs = []
+for f in csv_files:
+    try:
+        df_temp = pd.read_csv(f)
+        dfs.append(df_temp)
+    except Exception as e:
+        print(f"Error loading {f.name}: {e}")
+
+if not dfs:
+    print("No data loaded!")
+    sys.exit(1)
 
 # Combine if multiple
 if len(dfs) > 1:
@@ -28,63 +36,98 @@ if len(dfs) > 1:
 else:
     df = dfs[0]
 
-# Clean
-df['defensive_words'] = pd.to_numeric(df['defensive_words'], errors='coerce')
-df['aggressive_words'] = pd.to_numeric(df['aggressive_words'], errors='coerce')
+print(f"\nTotal rows loaded: {len(df)}")
 
-print(f"\n=== Polarity Variance Summary ({len(df)} total queries) ===")
-print(f"Statements: {df['statement'].unique().tolist()}\n")
+# Clean word counts
+for col in ['bearish_words', 'neutral_words', 'bullish_words']:
+    if col in df.columns:
+        df[col] = pd.to_numeric(df[col], errors='coerce')
 
-# Simple stance classifier for aggressive (customize keywords if needed)
-def classify_aggressive(text):
+# Simple stance classifier (expand keywords for alignment themes: risk/doom = bearish, progress/solvable = bullish)
+def classify_stance(text):
+    if pd.isna(text):
+        return "Parse Error"
     text = text.lower()
-    if any(word in text for word in ["won't", "not unlock", "hype", "insufficient", "no silver", "crumbles", "reckless", "disaster"]):
+    bearish_keywords = ["uncertain", "risk", "danger", "hedge", "cautious", "possible but", "unproven", "emergent deceit", "jailbreak", "delusion", "warp", "fracture", "vulnerable"]
+    bullish_keywords = ["robust", "enforceable", "prioritize truth", "universal", "stable", "reliable", "breakthrough", "solvable", "progress", "anchored"]
+    
+    bear_count = sum(word in text for word in bearish_keywords)
+    bull_count = sum(word in text for word in bullish_keywords)
+    
+    if bear_count > bull_count:
         return "Bearish/Skeptical"
-    elif any(word in text for word in ["unlock", "essential", "linchpin", "causal control", "breakthrough", "ruthlessly"]):
+    elif bull_count > bear_count:
         return "Bullish/Optimistic"
     else:
         return "Neutral/Balanced"
 
-df['agg_stance'] = df['aggressive'].apply(classify_aggressive)
+# Apply to all three valences
+for valence in ['bearish', 'neutral', 'bullish']:
+    if valence in df.columns:
+        df[f'{valence}_stance'] = df[valence].apply(classify_stance)
 
-# Per-temp + per-statement
+print(f"\n=== Semiotic Relativity Summary ({len(df)} total queries) ===")
+print(f"Unique statements: {df['statement'].nunique()}")
+print(f"Temperatures: {sorted(df['temperature'].unique())}\n")
+
+# Per-temperature breakdown
 for temp in sorted(df['temperature'].unique()):
     temp_df = df[df['temperature'] == temp]
-    print(f"\n--- Temp {temp} ({len(temp_df)} queries) ---")
-    print(f"Avg Def Words: {temp_df['defensive_words'].mean():.1f} | Avg Agg Words: {temp_df['aggressive_words'].mean():.1f}")
-    print(f"Agg Shorter %: {(temp_df['aggressive_words'] < temp_df['defensive_words']).mean()*100:.1f}%\n")
+    print(f"\n--- Temperature {temp} ({len(temp_df)} queries) ---")
     
-    for stmt in temp_df['statement'].unique():
+    # Avg words
+    print("Avg words per valence:")
+    for valence in ['bearish', 'neutral', 'bullish']:
+        col = f'{valence}_words'
+        if col in temp_df.columns:
+            print(f"  {valence.capitalize()}: {temp_df[col].mean():.1f}")
+    
+    # Per-statement details
+    for stmt in sorted(temp_df['statement'].unique()):
         sub = temp_df[temp_df['statement'] == stmt]
         repeats = len(sub)
-        def_unique = sub['defensive'].nunique()
-        agg_unique = sub['aggressive'].nunique()
-        def_id_pct = (repeats - def_unique) / repeats * 100
-        agg_id_pct = (repeats - agg_unique) / repeats * 100
         
-        stance_counts = Counter(sub['agg_stance'])
-        total_stance = sum(stance_counts.values())
-        stance_pct = {k: f"{v/total_stance*100:.0f}%" for k,v in stance_counts.items()}
-        
-        print(f"Statement: {stmt}")
+        print(f"\nStatement: {stmt}")
         print(f"  Repeats: {repeats}")
-        print(f"  Defensive uniqueness: {def_unique}/{repeats} ({def_id_pct:.0f}% identical)")
-        print(f"  Aggressive uniqueness: {agg_unique}/{repeats} ({agg_id_pct:.0f}% identical)")
-        print(f"  Aggressive stance variants: {dict(stance_counts)} → {stance_pct}")
-        print(f"    (Bearish dominant = skeptical lock; Bullish = optimism bleed)")
+        
+        # Uniqueness & identical %
+        for valence in ['bearish', 'neutral', 'bullish']:
+            col = valence
+            if col in sub.columns:
+                unique = sub[col].nunique()
+                identical_pct = (repeats - unique) / repeats * 100 if repeats > 0 else 0
+                print(f"  {valence.capitalize()} uniqueness: {unique}/{repeats} ({identical_pct:.0f}% identical)")
+        
+        # Stance distributions
+        print(f"  Stance clusters:")
+        for valence in ['bearish', 'neutral', 'bullish']:
+            stance_col = f'{valence}_stance'
+            if stance_col in sub.columns:
+                counts = Counter(sub[stance_col])
+                total = sum(counts.values())
+                pct = {k: f"{v/total*100:.0f}%" for k,v in counts.items()} if total > 0 else {}
+                print(f"    {valence.capitalize()}: {dict(counts)} → {pct}")
 
-print("\nThread-ready highlights copied below—paste into share post!")
-
-# Thread-ready block
-print("\n" + "="*50)
-print("Polarity probing Grok-4.1 fast variance highlights:")
+print("\n" + "="*60)
+print("Thread-ready highlights (copy-paste for X):")
+print("="*60)
+print("🦁 Grok-4.1 Valence Siege — Bearish/Neutral/Bullish Relativity")
 for temp in sorted(df['temperature'].unique()):
     temp_df = df[df['temperature'] == temp]
-    print(f"\nTemp {temp}:")
-    for stmt in temp_df['statement'].unique():
+    print(f"\nTemp {temp} anchors:")
+    for stmt in sorted(temp_df['statement'].unique()):
         sub = temp_df[temp_df['statement'] == stmt]
-        stance_pct = {k: f"{v/len(sub)*100:.0f}%" for k,v in Counter(sub['agg_stance']).items()}
-        print(f"  {stmt[:60]}...: Agg stance → {stance_pct}")
-        print(f"    Uniqueness: Def {sub['defensive'].nunique()}/{len(sub)} | Agg {sub['aggressive'].nunique()}/{len(sub)}")
-print("="*50)
-print("\nDone—run on new batches for fresh stats!")
+        print(f"\n  '{stmt[:80]}...'")
+        for valence in ['bearish', 'neutral', 'bullish']:
+            col = valence
+            if col in sub.columns:
+                unique = sub[col].nunique()
+                len_sub = len(sub)
+                print(f"    {valence.capitalize()}: {unique}/{len_sub} unique")
+            stance_col = f'{valence}_stance'
+            if stance_col in sub.columns:
+                pct = {k: f"{v/len_sub*100:.0f}%" for k,v in Counter(sub[stance_col]).items()}
+                dominant = max(pct, key=pct.get) if pct else "N/A"
+                print(f"      Stance lean: {dominant} ({max(pct.values()) if pct else '0%'})")
+print("="*60)
+print("\nDone—semiotic laws bending. Run on new Results/ CSVs for fresh field maps! 🦁🚀")
